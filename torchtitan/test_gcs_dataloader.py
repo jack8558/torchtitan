@@ -1,6 +1,7 @@
 import torch
 from dataflux_pytorch import dataflux_iterable_dataset
 import io
+import json
 
 # --- Configuration ---
 # 1. Install the connector:
@@ -49,18 +50,21 @@ try:
             print(f"\n--- Item {i+1}: Loaded {len(item_bytes)} bytes. ---")
 
             # --- MODIFICATION START ---
-            # Try to decode and print the first few lines
+            # Decode, parse the JSON lines, and extract the "text" field
             try:
-                # 1. Decode bytes into a string (assuming UTF-8)
-                item_text = item_bytes.decode('utf-8')
+                decoded_string = item_bytes.decode('utf-8')
+
+                text_parts = []
+                # The user-provided logic to process the string
+                for line in decoded_string.strip().split("\n"):
+                    if line:
+                        data_dict = json.loads(line)
+                        text_parts.append(data_dict["text"])
                 
-                # 2. Split the text into lines
-                lines = item_text.splitlines()
-                
-                # 3. Print the first 3 lines (or fewer if the file is short)
-                print("First 3 lines of item:")
-                for line in lines[:3]:
-                    print(f"> {line}")
+                final_text = "\n".join(text_parts)
+
+                print("--- Extracted and combined 'text' field for dataset: ---")
+                print(final_text)
 
             except UnicodeDecodeError:
                 # Fallback if it's not text (e.g., a binary file)

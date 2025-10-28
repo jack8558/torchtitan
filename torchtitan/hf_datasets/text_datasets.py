@@ -20,6 +20,9 @@ from torchtitan.config import JobConfig
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 
+from dataflux_pytorch import dataflux_iterable_dataset
+import json
+
 
 def _load_c4_dataset(dataset_path: str, split: str):
     """Load C4 dataset with default configuration."""
@@ -29,6 +32,31 @@ def _load_c4_dataset(dataset_path: str, split: str):
 def _process_c4_text(sample: dict[str, Any]) -> str:
     """Process C4 dataset sample text."""
     return sample["text"]
+
+def _process_gcs_text(sample: bytes) -> str:
+    """Process GCS dataset sample bytes by decoding."""
+    decoded_string = sample.decode("utf-8")
+    # GCS connector may return multiple json objects in one sample, with each
+    # line being a separate JSON object (JSON Lines format).
+    text_parts = []
+    for line in decoded_string.strip().split("\n"):
+        if line:
+            data_dict = json.loads(line)
+            text_parts.append(data_dict["text"])
+    return "\n".join(text_parts)
+
+def _load_gcs_dataset(dataset_path: str):
+    """Load GCS dataset with default configuration."""
+    iterable_dataset = dataflux_iterable_dataset.DataFluxIterableDataset(
+        project_name="tpu-pytorch",
+        bucket_name="torchprime",
+        config=dataflux_iterable_dataset.Config(
+            prefix=dataset_path,
+            disable_compose=True,
+        ),
+    )
+    return iterable_dataset
+
 
 
 # Add your dataset here - more information at docs/datasets.md
@@ -48,6 +76,11 @@ DATASETS = {
         loader=partial(_load_c4_dataset, split="validation"),
         sample_processor=_process_c4_text,
     ),
+    "gcs_c4_test": DatasetConfig(
+        path="jackoh-exp/gcs-connector/c4_test",
+        loader=partial(_load_gcs_dataset),
+        sample_processor=_process_gcs_text,
+    )
 }
 
 
@@ -84,10 +117,16 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         path, dataset_loader, text_processor = _validate_dataset(
             dataset_name, dataset_path
         )
-        ds = dataset_loader(path)
 
         self.dataset_name = dataset_name
-        self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
+
+        if dataset_name.startswith("gcs"):  # TODO need to add how to figure out spliting dataset by node
+            ds = dataset_loader(path)
+            self._data = ds
+        else:
+            ds = dataset_loader(path)
+            self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
+
         self._tokenizer = tokenizer
         self.seq_len = seq_len
         self.infinite = infinite
