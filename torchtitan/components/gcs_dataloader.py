@@ -6,15 +6,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 
 import torch
 from dataflux_pytorch import dataflux_iterable_dataset
-
-# if TYPE_CHECKING:
-#     import torchtitan.protocols.train_spec as train_spec_module
-#     from torchtitan.config import JobConfig
-
 
 def build_gcs_dataloader(
     job_config: JobConfig,
@@ -37,6 +31,11 @@ def build_gcs_dataloader(
     Returns:
         A torch.utils.data.DataLoader instance.
     """
+    # The Llama tokenizer does not have a pad_id, so we need to set it to the eos_id.
+    # This is a common practice for models that don't have a specific padding token.
+    if getattr(tokenizer, "pad_id", None) is None:
+        tokenizer.pad_id = tokenizer.eos_id
+
     gcs_config = job_config.gcs_dataset
     print(f"Connecting to GCS: gs://{gcs_config.bucket_name}/{gcs_config.data_prefix}")
 
@@ -49,28 +48,32 @@ def build_gcs_dataloader(
         ),
     )
 
-    # The GCS dataset yields raw bytes. We need to decode, tokenize, and format it.
-    def collate_fn(batch_of_bytes):
-        # Since batch_size=1, batch_of_bytes is a list with one element: [b'...']
-        try:
-            # An empty file or a file that cannot be decoded could cause an error.
-            if not batch_of_bytes or not batch_of_bytes[0]:
-                return None
-            text = batch_of_bytes[0].decode("utf-8")
-        except (UnicodeDecodeError, IndexError):
-            return None # Returning None will cause the DataLoader to skip this batch.
+    # AI generated code
+    def collate_fn(batch_of_byte_samples):
+        tokenized_samples = []
+        for byte_sample in batch_of_byte_samples:
+            try:
+                if not byte_sample:
+                    continue
+                text = byte_sample.decode("utf-8")
+                # Tokenize the text
+                tokens = tokenizer.encode(text, bos=True, eos=True)
+                tokenized_samples.append(torch.tensor(tokens, dtype=torch.long))
+            except (UnicodeDecodeError, IndexError):
+                # Skip corrupted data
+                continue
 
-        # Tokenize the text
-        tokens = tokenizer.encode(text, bos=True, eos=True)
-        tokens = torch.tensor(tokens, dtype=torch.long)
+        if not tokenized_samples:
+            # If all samples in the batch were bad, return None to skip.
+            return None
 
-        # Create input and labels for language modeling
-        inputs = tokens[:-1]
-        labels = tokens[1:]
+        # Pad to the longest sequence in the batch
+        padded_tokens = torch.nn.utils.rnn.pad_sequence(tokenized_samples, batch_first=True, padding_value=tokenizer.pad_id)
 
-        # The trainer expects a batch of (input_dict, labels)
-        # Here we create a "batch" of size 1
-        return [{"input": inputs.unsqueeze(0)}, labels.unsqueeze(0)]
+        inputs = padded_tokens[:, :-1]
+        labels = padded_tokens[:, 1:]
+
+        return [{"input": inputs}, labels]
 
     return torch.utils.data.DataLoader(
         iterable_dataset,
