@@ -136,6 +136,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             tokenizer=self.tokenizer,
             job_config=job_config,
         )
+
         # build model (using meta init)
         model_args = self.train_spec.model_args[job_config.model.flavor]
         # set the model args from training job configs

@@ -20,8 +20,6 @@ from torchtitan.config import JobConfig
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 
-import json
-
 
 def _load_c4_dataset(dataset_path: str, split: str):
     """Load C4 dataset with default configuration."""
@@ -31,18 +29,6 @@ def _load_c4_dataset(dataset_path: str, split: str):
 def _process_c4_text(sample: dict[str, Any]) -> str:
     """Process C4 dataset sample text."""
     return sample["text"]
-
-def _process_gcs_text(sample: bytes) -> str:
-    """Process GCS dataset sample bytes by decoding."""
-    decoded_string = sample.decode("utf-8")
-    # GCS connector may return multiple json objects in one sample, with each
-    # line being a separate JSON object (JSON Lines format).
-    text_parts = []
-    for line in decoded_string.strip().split("\n"):
-        if line:
-            data_dict = json.loads(line)
-            text_parts.append(data_dict["text"])
-    return "\n".join(text_parts)
 
 def _load_gcs_dataset(dataset_path: str):
     """Load GCS dataset with huggingface/datasets."""
