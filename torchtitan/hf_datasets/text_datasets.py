@@ -20,7 +20,6 @@ from torchtitan.config import JobConfig
 from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 
-from dataflux_pytorch import dataflux_iterable_dataset
 import json
 
 
@@ -46,16 +45,16 @@ def _process_gcs_text(sample: bytes) -> str:
     return "\n".join(text_parts)
 
 def _load_gcs_dataset(dataset_path: str):
-    """Load GCS dataset with default configuration."""
-    iterable_dataset = dataflux_iterable_dataset.DataFluxIterableDataset(
-        project_name="tpu-pytorch",
-        bucket_name="torchprime",
-        config=dataflux_iterable_dataset.Config(
-            prefix=dataset_path,
-            disable_compose=True,
-        ),
-    )
-    return iterable_dataset
+    """Load GCS dataset with huggingface/datasets."""
+    full_gcs_path = f"gcs://torchprime/{dataset_path}/data.json"
+    logger.info(f"Loading GCS data from: {full_gcs_path}")
+
+    return load_dataset(
+            "json",
+            data_files=full_gcs_path,
+            streaming=True,
+            split="train"  # Must specify a split when streaming
+        )
 
 
 
@@ -79,8 +78,8 @@ DATASETS = {
     "gcs_c4_test": DatasetConfig(
         path="jackoh-exp/gcs-connector/c4_test",
         loader=partial(_load_gcs_dataset),
-        sample_processor=_process_gcs_text,
-    )
+        sample_processor=_process_c4_text,
+    ),
 }
 
 
@@ -120,12 +119,8 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
 
         self.dataset_name = dataset_name
 
-        if dataset_name.startswith("gcs"):  # TODO need to add how to figure out spliting dataset by node
-            ds = dataset_loader(path)
-            self._data = ds
-        else:
-            ds = dataset_loader(path)
-            self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
+        ds = dataset_loader(path)
+        self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
 
         self._tokenizer = tokenizer
         self.seq_len = seq_len
