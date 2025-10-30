@@ -30,6 +30,19 @@ def _process_c4_text(sample: dict[str, Any]) -> str:
     """Process C4 dataset sample text."""
     return sample["text"]
 
+def _load_gcs_dataset(dataset_path: str):
+    """Load GCS dataset with huggingface/datasets."""
+    full_gcs_path = f"gcs://torchprime/{dataset_path}/data.json"
+    logger.info(f"Loading GCS data from: {full_gcs_path}")
+
+    return load_dataset(
+            "json",
+            data_files=full_gcs_path,
+            streaming=True,
+            split="train"  # Must specify a split when streaming
+        )
+
+
 
 # Add your dataset here - more information at docs/datasets.md
 DATASETS = {
@@ -46,6 +59,11 @@ DATASETS = {
     "c4_validation": DatasetConfig(
         path="allenai/c4",
         loader=partial(_load_c4_dataset, split="validation"),
+        sample_processor=_process_c4_text,
+    ),
+    "gcs_c4_test": DatasetConfig(
+        path="jackoh-exp/gcs-connector/c4_test",
+        loader=partial(_load_gcs_dataset),
         sample_processor=_process_c4_text,
     ),
 }
@@ -84,10 +102,12 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         path, dataset_loader, text_processor = _validate_dataset(
             dataset_name, dataset_path
         )
-        ds = dataset_loader(path)
 
         self.dataset_name = dataset_name
+
+        ds = dataset_loader(path)
         self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
+
         self._tokenizer = tokenizer
         self.seq_len = seq_len
         self.infinite = infinite
