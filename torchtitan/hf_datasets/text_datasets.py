@@ -13,6 +13,7 @@ from datasets import Dataset, load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import IterableDataset
+from torch.utils import data  # <-- IMPORT ADDED
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.tokenizer import BaseTokenizer
@@ -33,18 +34,23 @@ def _process_c4_text(sample: dict[str, Any]) -> str:
     """Process C4 dataset sample text."""
     return sample["text"]
 
-def _process_gcs_text(sample: bytes) -> str:
-    """Process GCS dataset sample bytes by decoding."""
-    decoded_string = sample.decode("utf-8")
-    # GCS connector may return multiple json objects in one sample, with each
-    # line being a separate JSON object (JSON Lines format).
-    text_parts = []
-    for line in decoded_string.strip().split("\n"):
-        if line:
-            data_dict = json.loads(line)
-            text_parts.append(data_dict["text"])
-    return "\n".join(text_parts)
+# --- MODIFIED: This is now a generator ---
+def _process_gcs_text(sample: bytes):
+    """
+    Process GCS dataset sample bytes by decoding.
+    This is now a GENERATOR that yields one text sample per JSON line.
+    """
+    try:
+        decoded_string = sample.decode("utf-8")
+        for line in decoded_string.strip().split("\n"):
+            if line:
+                data_dict = json.loads(line)
+                yield data_dict["text"]
+    except Exception as e:
+        logger.warning(f"Failed to decode or parse JSON line: {e}. Skipping sample.")
+        return
 
+# --- MODIFIED: Added sort_listing_results=True ---
 def _load_gcs_dataset(dataset_path: str):
     """Load GCS dataset with default configuration."""
     iterable_dataset = dataflux_iterable_dataset.DataFluxIterableDataset(
@@ -53,6 +59,9 @@ def _load_gcs_dataset(dataset_path: str):
         config=dataflux_iterable_dataset.Config(
             prefix=dataset_path,
             disable_compose=True,
+            # CRITICAL: All ranks must read files in the same order
+            # for sample-level sharding to be consistent.
+            sort_listing_results=True,
         ),
     )
     return iterable_dataset
@@ -120,17 +129,27 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
 
         self.dataset_name = dataset_name
 
-        if dataset_name.startswith("gcs"):  # TODO need to add how to figure out spliting dataset by node
+        # --- MODIFIED: Simplified GCS loading ---
+        if dataset_name.startswith("gcs"):
+            # Load the base DataFlux dataset.
+            # We are NOT sharding here. All ranks get the same iterator.
+            # Sharding will happen in __iter__.
             ds = dataset_loader(path)
             self._data = ds
         else:
+            # Non-GCS datasets use the existing split_dataset_by_node
             ds = dataset_loader(path)
             self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
 
         self._tokenizer = tokenizer
         self.seq_len = seq_len
         self.infinite = infinite
-        self._text_processor = text_processor
+        self._text_processor = text_processor # This is now _process_gcs_text (a generator)
+
+        # --- Store rank and world size ---
+        self.dp_rank = dp_rank
+        self.dp_world_size = dp_world_size
+        # ---------------------------------
 
         # Variables for checkpointing
         self._sample_idx = 0
@@ -144,38 +163,114 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
                 return iter([])
             else:
                 return iter(self._data.skip(self._sample_idx))
-
+        
+        # For DataFlux, this correctly calls its __iter__
         return iter(self._data)
 
+    # --- ENTIRE __iter__ METHOD IS UPDATED ---
     def __iter__(self):
         max_buffer_token_len = 1 + self.seq_len
 
-        while True:
-            for sample in self._get_data_iter():
-                # Use the dataset-specific text processor
-                sample_text = self._text_processor(sample)
-                sample_tokens = self._tokenizer.encode(
-                    sample_text, add_bos=True, add_eos=True
-                )
-                self._token_buffer.extend(sample_tokens)
-                self._sample_idx += 1
+        # --- Get DataLoader worker info ---
+        worker_info = data.get_worker_info()
+        if worker_info is None:
+            # Single-process loading (or main process)
+            num_workers = 1
+            worker_id = 0
+        else:
+            # Multi-process loading
+            num_workers = worker_info.num_workers
+            worker_id = worker_info.id
 
-                while len(self._token_buffer) >= max_buffer_token_len:
-                    x = torch.LongTensor(self._token_buffer[:max_buffer_token_len])
-                    # update tokens to the remaining tokens
-                    self._token_buffer = self._token_buffer[max_buffer_token_len:]
-                    input = x[:-1]
-                    label = x[1:]
-                    yield {"input": input}, label
+        # --- Calculate global rank for sample sharding ---
+        # This combines DDP rank and DataLoader worker rank
+        # to give every single process a unique ID.
+        global_rank = self.dp_rank * num_workers + worker_id
+        global_world_size = self.dp_world_size * num_workers
+
+        logger.info(
+            f"[Rank {self.dp_rank} (Worker {worker_id})] "
+            f"Starting iter. Global Rank: {global_rank} / {global_world_size}"
+        )
+
+        is_gcs_dataset = self.dataset_name.startswith("gcs")
+
+        while True:
+            overall_sample_index = 0
+            samples_processed_by_this_rank = 0
+
+            # self._get_data_iter() returns an iterator
+            # For GCS, 'sample_or_file_bytes' is the raw bytes of one file
+            # For HF, 'sample_or_file_bytes' is one pre-sharded sample
+            for sample_or_file_bytes in self._get_data_iter():
+
+                if is_gcs_dataset:
+                    # --- GCS SHARDING LOGIC ---
+                    
+                    # _text_processor is _process_gcs_text (our generator)
+                    # It yields one 'sample_text' (one JSON line) at a time
+                    for sample_text in self._text_processor(sample_or_file_bytes):
+                        
+                        # --- THIS IS THE MANUAL SHARDING ---
+                        # Each process only handles samples where the index
+                        # matches its unique global rank.
+                        if overall_sample_index % global_world_size == global_rank:
+                            if not sample_text:
+                                continue # Skip empty samples
+
+                            sample_tokens = self._tokenizer.encode(
+                                sample_text, add_bos=True, add_eos=True
+                            )
+                            self._token_buffer.extend(sample_tokens)
+                            samples_processed_by_this_rank += 1
+
+                            while len(self._token_buffer) >= max_buffer_token_len:
+                                x = torch.LongTensor(self._token_buffer[:max_buffer_token_len])
+                                self._token_buffer = self._token_buffer[max_buffer_token_len:]
+                                input = x[:-1]
+                                label = x[1:]
+                                yield {"input": input}, label
+                        
+                        # This index must increment for *every* sample,
+                        # even those skipped by other ranks.
+                        overall_sample_index += 1
+                
+                else:
+                    # --- Original HuggingFace Logic ---
+                    # Data is already sharded by split_dataset_by_node
+                    sample_text = self._text_processor(sample_or_file_bytes)
+                    sample_tokens = self._tokenizer.encode(
+                        sample_text, add_bos=True, add_eos=True
+                    )
+                    self._token_buffer.extend(sample_tokens)
+                    samples_processed_by_this_rank += 1
+
+                    while len(self._token_buffer) >= max_buffer_token_len:
+                        x = torch.LongTensor(self._token_buffer[:max_buffer_token_len])
+                        self._token_buffer = self._token_buffer[max_buffer_token_len:]
+                        input = x[:-1]
+                        label = x[1:]
+                        yield {"input": input}, label
+
+            # --- End of all files/samples ---
+            log_prefix = f"[Rank {self.dp_rank} (Worker {worker_id})]"
+            log_msg = (
+                f"(Processed {samples_processed_by_this_rank} samples)"
+            )
 
             if not self.infinite:
+                logger.info(f"========== {log_prefix} {log_msg} ==========")
                 logger.warning(f"Dataset {self.dataset_name} has run out of data")
                 break
             else:
-                # Reset offset for the next iteration
-                self._sample_idx = 0
+                logger.info(f"========== {log_prefix} {log_msg} ==========")
+                
+                # Reset counters for next loop
+                self._sample_idx = 0 
+                samples_processed_by_this_rank = 0
+
                 logger.warning(f"Dataset {self.dataset_name} is being re-looped")
-                # Ensures re-looping a dataset loaded from a checkpoint works correctly
+                
                 if not isinstance(self._data, Dataset):
                     if hasattr(self._data, "set_epoch") and hasattr(
                         self._data, "epoch"
@@ -188,8 +283,13 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         if isinstance(self._data, Dataset):
             self._sample_idx = state_dict["sample_idx"]
         else:
-            assert "data" in state_dict
-            self._data.load_state_dict(state_dict["data"])
+            # This handles both HF streaming datasets and our
+            # DataFluxIterableDataset (if it were to implement state_dict)
+            if hasattr(self._data, "load_state_dict") and "data" in state_dict:
+                self._data.load_state_dict(state_dict["data"])
+            else:
+                logger.warning("Could not load state_dict for iterable dataset.")
+
 
     def state_dict(self):
         _state_dict = {"token_buffer": self._token_buffer}
@@ -198,8 +298,8 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
             _state_dict["sample_idx"] = self._sample_idx
         else:
             # Save the iterable dataset's state to later efficiently resume from it
-            # https://huggingface.co/docs/datasets/v3.5.0/en/stream#save-a-dataset-checkpoint-and-resume-iteration
-            _state_dict["data"] = self._data.state_dict()
+            if hasattr(self._data, "state_dict"):
+                _state_dict["data"] = self._data.state_dict()
 
         return _state_dict
 
@@ -232,6 +332,8 @@ def build_text_dataloader(
         dp_rank=dp_rank,
         dp_world_size=dp_world_size,
         batch_size=batch_size,
+        # num_workers=... (if you add num_workers > 0 here,
+        # the worker sharding in __iter__ will activate)
     )
 
 
