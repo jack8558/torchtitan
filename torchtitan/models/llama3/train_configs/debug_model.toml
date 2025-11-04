@@ -1,5 +1,4 @@
 [job]
-dump_folder = "./outputs"
 description = "Llama 3 debug training"
 print_config = false
 
@@ -53,9 +52,12 @@ pipeline_parallel_schedule = "Interleaved1F1B"
 context_parallel_degree = 1
 
 [checkpoint]
-enable = false
-folder = "checkpoint"
-interval = 10
+enable = true
+# All training artifacts are saved under dump_folder, so it's good practice
+# to save checkpoints there as well. To save to GCS, use a gcs:// path.
+# Make sure your environment is authenticated with GCS.
+folder = "gcs://torchprime/jackoh-exp/checkpoint-exp/debug_checkpoints"
+interval = 5 # Save a checkpoint every 5 steps
 last_save_model_only = false
 export_dtype = "float32"
 async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]
