@@ -299,6 +299,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.step = 0
         self.ntokens_seen = 0
 
+        # If checkpoint folder is a GCS path, don't prepend the local dump_folder.
+        checkpoint_base_folder = job_config.job.dump_folder
+        if job_config.checkpoint.folder.startswith("gcs://"):
+            logger.info("GCS checkpoint path detected. Ignoring local dump_folder for checkpointing.")
+            checkpoint_base_folder = ""
+
         self.checkpointer = CheckpointManager(
             dataloader=self.dataloader,
             model_parts=self.model_parts,
@@ -313,7 +319,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 if self.train_spec.state_dict_adapter
                 else None
             ),
-            base_folder=job_config.job.dump_folder,
+            base_folder=checkpoint_base_folder,
             ft_manager=self.ft_manager,
         )
 
